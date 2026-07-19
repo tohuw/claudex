@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+skill_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_cli=$(CDPATH= cd -- "$skill_dir/../.." 2>/dev/null && pwd)/claudex
+
+if [ -x "$repo_cli" ]; then
+    exec "$repo_cli" "$@"
+fi
+
+project_cli="$HOME/Projects/claudex/claudex"
+if [ -x "$project_cli" ]; then
+    exec "$project_cli" "$@"
+fi
+
+if command -v claudex >/dev/null 2>&1; then
+    exec claudex "$@"
+fi
+
+echo "claudex skill: CLI not found; expected ~/Projects/claudex/claudex or claudex on PATH" >&2
+exit 127

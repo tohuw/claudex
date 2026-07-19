@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claudex"
+  short_description: "Search Claude Code and Claude.ai history"
+  default_prompt: "Use $claudex to find our prior Claude conversation about this topic."
