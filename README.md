@@ -9,6 +9,8 @@ Two sources, unified search:
 - **code** — Claude Code session JSONLs at `~/.claude/projects/<encoded-cwd>/`
 - **cloud** — claude.ai data exports (`conversations.json` from a downloaded export)
 
+_Developed with AI assistance. See the git history for which agents contributed._
+
 ## How it works
 
 ### Code transcripts (always-on)
