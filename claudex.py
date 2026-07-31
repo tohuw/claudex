@@ -28,6 +28,21 @@ CLOUD_INDEX_DIR = Path.home() / ".claudex" / "cloud" / "index"
 CLOUD_SUMMARIES_DIR = Path.home() / ".claudex" / "cloud" / "summaries"
 CLOUD_MANIFEST = Path.home() / ".claudex" / "cloud" / "manifest.tsv"
 
+CLOUD_PROJ_RAW_DIR = Path.home() / ".claudex" / "cloud" / "projects" / "raw"
+CLOUD_PROJ_INDEX_DIR = Path.home() / ".claudex" / "cloud" / "projects" / "index"
+CLOUD_PROJ_MEMORY_DIR = Path.home() / ".claudex" / "cloud" / "projects" / "memory"
+CLOUD_PROJ_MANIFEST = Path.home() / ".claudex" / "cloud" / "projects" / "manifest.tsv"
+CLOUD_MEMORY_RAW = Path.home() / ".claudex" / "cloud" / "memory" / "memories.json"
+CLOUD_MEMORY_INDEX_DIR = Path.home() / ".claudex" / "cloud" / "memory" / "index"
+
+# Deleted tier: content that vanished from the newest claude.ai export lives
+# here — excluded from normal search/list, reachable via --deleted and `show`.
+CLOUD_INDEX_DELETED_DIR = Path.home() / ".claudex" / "cloud" / "index-deleted"
+CLOUD_MANIFEST_DELETED = Path.home() / ".claudex" / "cloud" / "manifest-deleted.tsv"
+CLOUD_PROJ_INDEX_DELETED_DIR = Path.home() / ".claudex" / "cloud" / "projects" / "index-deleted"
+CLOUD_PROJ_MANIFEST_DELETED = Path.home() / ".claudex" / "cloud" / "projects" / "manifest-deleted.tsv"
+CLOUD_MEMORY_INDEX_DELETED_DIR = Path.home() / ".claudex" / "cloud" / "memory" / "index-deleted"
+
 SYNTHESES_DIR = Path.home() / ".claudex" / "syntheses"
 STATE_FILE = Path.home() / ".claudex" / "state.json"
 FASTMAIL_TOKEN_FILE = Path.home() / ".claudex" / "secrets" / "fastmail.token"
@@ -588,25 +603,237 @@ def write_cloud_index(meta: dict, turns: list[Turn], out: Path):
 
 
 def update_cloud_manifest():
-    rows = []
-    for ix in sorted(CLOUD_INDEX_DIR.glob("*.txt")):
-        meta = _read_meta(ix)
-        rows.append((
-            meta.get("session", ix.stem),
-            meta.get("start", ""),
-            meta.get("end", ""),
-            meta.get("name", ""),
-            meta.get("turns", ""),
-        ))
-    CLOUD_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    with CLOUD_MANIFEST.open("w") as f:
-        f.write("session_id\tstart\tend\tname\tturns\n")
-        for r in rows:
-            f.write("\t".join(r) + "\n")
+    for index_dir, manifest in ((CLOUD_INDEX_DIR, CLOUD_MANIFEST),
+                                (CLOUD_INDEX_DELETED_DIR, CLOUD_MANIFEST_DELETED)):
+        rows = []
+        for ix in sorted(index_dir.glob("*.txt")) if index_dir.exists() else []:
+            meta = _read_meta(ix)
+            rows.append((
+                meta.get("session", ix.stem),
+                meta.get("start", ""),
+                meta.get("end", ""),
+                meta.get("name", ""),
+                meta.get("turns", ""),
+            ))
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        with manifest.open("w") as f:
+            f.write("session_id\tstart\tend\tname\tturns\n")
+            for r in rows:
+                f.write("\t".join(r) + "\n")
 
 
 def cloud_raw_path(uuid: str) -> Path:
     return CLOUD_RAW_DIR / f"{uuid}.json"
+
+
+# ----- claude.ai projects + memories ingest -----
+
+def _memhash(text: str) -> str:
+    """Short content hash for project memory text; '-' when empty."""
+    if not text:
+        return "-"
+    import hashlib
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def render_project_index(proj: dict, memory_text: str) -> str:
+    docs = proj.get("docs") or []
+    lines = [
+        f"# project: {proj.get('uuid', '')}",
+        "# kind: project",
+        f"# name: {proj.get('name', '')}",
+        f"# start: {proj.get('created_at', '')}",
+        f"# end: {proj.get('updated_at', '')}",
+        f"# docs: {len(docs)}",
+        f"# memhash: {_memhash(memory_text)}",
+        "",
+    ]
+    if proj.get("name"):
+        lines += ["[NAME]", proj["name"], ""]
+    if proj.get("description"):
+        lines += ["[DESCRIPTION]", proj["description"], ""]
+    if proj.get("prompt_template"):
+        lines += ["[PROMPT]", proj["prompt_template"], ""]
+    if memory_text:
+        lines += ["[MEMORY]", memory_text, ""]
+    for d in docs:
+        content = (d.get("content") or "").strip()
+        lines += [f"[DOC {d.get('filename', 'untitled')}]", content, ""]
+    return "\n".join(lines) + "\n"
+
+
+def load_export_memories(export: Path) -> dict | None:
+    """First entry of the export's memories.json, or None if absent/unreadable."""
+    mf = export / "memories.json"
+    if not mf.exists():
+        return None
+    try:
+        entries = json.loads(mf.read_text(errors="replace"))
+    except Exception as e:
+        print(f"memories.json unreadable: {e}", file=sys.stderr)
+        return None
+    return entries[0] if isinstance(entries, list) and entries else None
+
+
+def _memory_slug(path: str) -> str:
+    slug = path.strip("/").replace("/", "-")
+    return re.sub(r"[^\w.-]+", "-", slug) or "unnamed"
+
+
+def write_memory_indexes(mem: dict) -> set[str]:
+    """Flatten conversations_memory + memory_files into the memory index.
+    Returns the slugs written — the upstream-active memory set. Entries no
+    longer present upstream are moved to the deleted tier by the caller's
+    sync pass, not erased."""
+    CLOUD_MEMORY_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    slugs: set[str] = set()
+    conv = (mem.get("conversations_memory") or "").strip()
+    if conv:
+        atomic_write(
+            CLOUD_MEMORY_INDEX_DIR / "conversations-memory.txt",
+            "# kind: memory\n# name: conversations memory\n# scope: global\n\n" + conv + "\n")
+        slugs.add("conversations-memory")
+    for mfile in mem.get("memory_files") or []:
+        path = mfile.get("path") or "unnamed"
+        content = (mfile.get("content") or "").strip()
+        if not content:
+            continue
+        slug = _memory_slug(path)
+        atomic_write(
+            CLOUD_MEMORY_INDEX_DIR / f"{slug}.txt",
+            f"# kind: memory\n# name: {path}\n# scope: file\n\n" + content + "\n")
+        slugs.add(slug)
+    return slugs
+
+
+def update_proj_manifest():
+    for index_dir, manifest in ((CLOUD_PROJ_INDEX_DIR, CLOUD_PROJ_MANIFEST),
+                                (CLOUD_PROJ_INDEX_DELETED_DIR, CLOUD_PROJ_MANIFEST_DELETED)):
+        rows = []
+        for ix in sorted(index_dir.glob("*.txt")) if index_dir.exists() else []:
+            meta = _read_meta(ix)
+            rows.append((
+                meta.get("project", ix.stem),
+                meta.get("start", ""),
+                meta.get("end", ""),
+                meta.get("name", ""),
+                meta.get("docs", ""),
+                "yes" if meta.get("memhash", "-") != "-" else "no",
+            ))
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        with manifest.open("w") as f:
+            f.write("project_id\tstart\tend\tname\tdocs\tmemory\n")
+            for r in rows:
+                f.write("\t".join(r) + "\n")
+
+
+def render_project_memory_tombstone(proj: dict, memory_text: str) -> str:
+    return "\n".join([
+        f"# project: {proj.get('uuid', '')}",
+        "# kind: project-memory",
+        f"# name: {proj.get('name', '')} (project memory — cleared upstream)",
+        f"# end: {proj.get('updated_at', '')}",
+        "",
+        "[MEMORY]",
+        memory_text,
+        "",
+    ]) + "\n"
+
+
+def _sync_deleted_tier(active_ids: set[str] | None, index_dir: Path, deleted_dir: Path) -> tuple[int, int]:
+    """Move indexes whose id is gone upstream into deleted_dir; restore ones
+    that reappeared. active_ids=None means this tier's upstream state is
+    unknown — no-op. Returns (n_moved, n_restored)."""
+    if active_ids is None:
+        return 0, 0
+    n_moved = n_restored = 0
+    if index_dir.exists():
+        for p in list(index_dir.glob("*.txt")):
+            if p.stem not in active_ids:
+                deleted_dir.mkdir(parents=True, exist_ok=True)
+                p.rename(deleted_dir / p.name)
+                n_moved += 1
+    if deleted_dir.exists():
+        for p in list(deleted_dir.glob("*.txt")):
+            if p.stem in active_ids:
+                tgt = index_dir / p.name
+                if tgt.exists():
+                    p.unlink()  # a fresh copy was just ingested
+                else:
+                    p.rename(tgt)
+                n_restored += 1
+    return n_moved, n_restored
+
+
+def ingest_projects_and_memories(export: Path, force: bool = False) -> dict:
+    """Ingest memories.json and projects/*.json from a claude.ai export.
+    Project memories are embedded into their project's index file; the global
+    conversations memory and memory files get their own index. Returns counts."""
+    counts = {"proj_written": 0, "proj_cached": 0, "proj_total": 0,
+              "proj_with_memory": 0, "memory_files": 0,
+              "proj_ids": None, "mem_slugs": None, "max_updated": ""}
+    mem = load_export_memories(export)
+    if mem:
+        CLOUD_MEMORY_RAW.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(CLOUD_MEMORY_RAW, json.dumps(mem))
+        counts["mem_slugs"] = write_memory_indexes(mem)
+        counts["memory_files"] = len(counts["mem_slugs"])
+    proj_memories = (mem or {}).get("project_memories") or {}
+    proj_dir = export / "projects"
+    proj_files = sorted(proj_dir.glob("*.json")) if proj_dir.is_dir() else []
+    counts["proj_total"] = len(proj_files)
+    if not proj_files:
+        if proj_memories:
+            print(f"  note: {len(proj_memories)} project memories but no projects/ dir — not indexed", file=sys.stderr)
+        return counts
+    counts["proj_ids"] = set()
+    CLOUD_PROJ_RAW_DIR.mkdir(parents=True, exist_ok=True)
+    CLOUD_PROJ_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    for pf in proj_files:
+        try:
+            proj = json.loads(pf.read_text(errors="replace"))
+        except Exception as e:
+            print(f"  skipping {pf.name}: {e}", file=sys.stderr)
+            continue
+        uuid = proj.get("uuid")
+        if not uuid:
+            continue
+        counts["proj_ids"].add(uuid)
+        counts["max_updated"] = max(counts["max_updated"], proj.get("updated_at", ""))
+        memory_text = (proj_memories.get(uuid) or "").strip()
+        # sidecar keeps the last-known memory forever; a memory cleared
+        # upstream moves to a deleted-tier tombstone instead of the index
+        side = CLOUD_PROJ_MEMORY_DIR / f"{uuid}.md"
+        tomb = CLOUD_PROJ_INDEX_DELETED_DIR / f"{uuid}.memory.txt"
+        if memory_text:
+            CLOUD_PROJ_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+            atomic_write(side, memory_text + "\n")
+            tomb.unlink(missing_ok=True)
+            counts["proj_with_memory"] += 1
+        elif mem is not None and side.exists():
+            CLOUD_PROJ_INDEX_DELETED_DIR.mkdir(parents=True, exist_ok=True)
+            atomic_write(tomb, render_project_memory_tombstone(
+                proj, side.read_text(errors="replace").strip()))
+        index_out = CLOUD_PROJ_INDEX_DIR / f"{uuid}.txt"
+        deleted_out = CLOUD_PROJ_INDEX_DELETED_DIR / f"{uuid}.txt"
+        # idempotency: same updated_at and (when memories present) same memory
+        # hash — also honored for a copy currently in the deleted tier
+        if not force:
+            existing_at = index_out if index_out.exists() else (deleted_out if deleted_out.exists() else None)
+            if existing_at:
+                existing = _read_meta(existing_at)
+                same_end = existing.get("end") == proj.get("updated_at", "")
+                same_mem = mem is None or existing.get("memhash", "-") == _memhash(memory_text)
+                if same_end and same_mem:
+                    counts["proj_cached"] += 1
+                    continue
+        atomic_write(CLOUD_PROJ_RAW_DIR / f"{uuid}.json", json.dumps(proj))
+        atomic_write(index_out, render_project_index(proj, memory_text))
+        counts["proj_written"] += 1
+    orphans = [u for u in proj_memories if u not in counts["proj_ids"]]
+    if orphans:
+        print(f"  note: {len(orphans)} project memories reference unknown projects — not indexed", file=sys.stderr)
+    return counts
 
 
 # ----- state.json: tracks expecting-export bit, ingested/dismissed exports -----
@@ -833,11 +1060,12 @@ def cmd_cloud_ingest(args):
             continue
         raw_out = cloud_raw_path(uuid)
         index_out = CLOUD_INDEX_DIR / f"{uuid}.txt"
+        deleted_out = CLOUD_INDEX_DELETED_DIR / f"{uuid}.txt"
         updated_at = conv.get("updated_at", "")
-        # idempotency: skip if index exists and has same end timestamp
-        if not args.force and index_out.exists():
-            existing = _read_meta(index_out)
-            if existing.get("end") == updated_at:
+        # idempotency: skip if an index (active or deleted tier) has same end
+        if not args.force:
+            existing_at = index_out if index_out.exists() else (deleted_out if deleted_out.exists() else None)
+            if existing_at and _read_meta(existing_at).get("end") == updated_at:
                 n_cached += 1
                 continue
         meta, turns = parse_cloud_conversation(conv)
@@ -847,9 +1075,50 @@ def cmd_cloud_ingest(args):
         atomic_write(raw_out, json.dumps(conv))
         write_cloud_index(meta, turns, index_out)
         n_written += 1
-    update_cloud_manifest()
-    # Mark this export as ingested + clear the expecting-export bit.
+    pm = ingest_projects_and_memories(export, force=args.force)
+
+    # ----- deleted-tier sync -----
+    # Projects and memories are complete snapshots in every export, so the
+    # newest export yet seen defines their upstream-active sets. But
+    # conversations.json may cover only a ~30-day window: only an export the
+    # user vouches for via --full may define the active conversation set;
+    # windowed exports newer than the last full one can only ADD to it.
+    conv_ids = {c.get("uuid") for c in convs if c.get("uuid")}
+    conv_ts = max((c.get("updated_at") or "" for c in convs), default="")
+    this_ts = max(conv_ts, pm["max_updated"])
     state = read_state()
+    active = state.setdefault("active_upstream", {})
+    if this_ts and this_ts >= state.get("export_watermark", ""):
+        state["export_watermark"] = this_ts
+        if pm["proj_ids"] is not None:
+            active["proj"] = sorted(pm["proj_ids"])
+        if pm["mem_slugs"] is not None:
+            active["memfile"] = sorted(pm["mem_slugs"])
+    full_wm = state.get("full_export_watermark", "")
+    if getattr(args, "full", False):
+        if conv_ts and conv_ts >= full_wm:
+            state["full_export_watermark"] = conv_ts
+            active["conv"] = sorted(conv_ids)
+    elif active.get("conv") is not None and conv_ts >= full_wm:
+        active["conv"] = sorted(set(active["conv"]) | conv_ids)
+
+    def _active(key):
+        v = active.get(key)
+        return set(v) if v is not None else None
+
+    n_moved = n_restored = 0
+    for ids, idx_dir, del_dir in (
+        (_active("conv"), CLOUD_INDEX_DIR, CLOUD_INDEX_DELETED_DIR),
+        (_active("proj"), CLOUD_PROJ_INDEX_DIR, CLOUD_PROJ_INDEX_DELETED_DIR),
+        (_active("memfile"), CLOUD_MEMORY_INDEX_DIR, CLOUD_MEMORY_INDEX_DELETED_DIR),
+    ):
+        d, r = _sync_deleted_tier(ids, idx_dir, del_dir)
+        n_moved += d
+        n_restored += r
+    update_cloud_manifest()
+    update_proj_manifest()
+
+    # Mark this export as ingested + clear the expecting-export bit.
     state.setdefault("ingested", {})
     from datetime import datetime, timezone
     state["ingested"][export.name] = {
@@ -858,10 +1127,22 @@ def cmd_cloud_ingest(args):
         "n_cached": n_cached,
         "n_empty": n_empty,
         "n_total": len(convs),
+        "n_projects": pm["proj_written"],
+        "n_memory_files": pm["memory_files"],
     }
     state.pop("expecting_export", None)
     write_state(state)
     print(f"cloud indexed: {n_written} written, {n_cached} cached, {n_empty} empty (total {len(convs)})")
+    if pm["proj_total"]:
+        print(f"projects indexed: {pm['proj_written']} written, {pm['proj_cached']} cached "
+              f"(total {pm['proj_total']}; {pm['proj_with_memory']} with project memory)")
+    if pm["memory_files"]:
+        print(f"memory indexed: {pm['memory_files']} files (global + memory directory)")
+    if n_moved or n_restored:
+        print(f"deleted tier: {n_moved} moved out of normal search, {n_restored} restored")
+    if active.get("conv") is None:
+        print("note: conversation deletion state unknown — ingest a FULL export with "
+              "`cloud-ingest --full` to separate deleted conversations")
     print(f"index dir: {CLOUD_INDEX_DIR}")
     return 0
 
@@ -982,18 +1263,29 @@ def _in_date_range(meta: dict, since: str | None, until: str | None) -> bool:
     return True
 
 
-def _all_index_files() -> list[tuple[Path, str]]:
-    """Return [(index_txt, source)] across both code and cloud."""
-    out: list[tuple[Path, str]] = []
-    if INDEX_DIR.exists():
-        out.extend((p, "code") for p in sorted(INDEX_DIR.glob("*.txt")))
-    if CLOUD_INDEX_DIR.exists():
-        out.extend((p, "cloud") for p in sorted(CLOUD_INDEX_DIR.glob("*.txt")))
+def _all_index_files(include_deleted: bool = False) -> list[tuple[Path, str, bool]]:
+    """Return [(index_txt, source, is_deleted)] across code, cloud, project,
+    and memory. The deleted tier (content gone from claude.ai) is included
+    only on request."""
+    out: list[tuple[Path, str, bool]] = []
+
+    def _add(d: Path, source: str, deleted: bool = False):
+        if d.exists():
+            out.extend((p, source, deleted) for p in sorted(d.glob("*.txt")))
+
+    _add(INDEX_DIR, "code")
+    _add(CLOUD_INDEX_DIR, "cloud")
+    _add(CLOUD_PROJ_INDEX_DIR, "project")
+    _add(CLOUD_MEMORY_INDEX_DIR, "memory")
+    if include_deleted:
+        _add(CLOUD_INDEX_DELETED_DIR, "cloud", True)
+        _add(CLOUD_PROJ_INDEX_DELETED_DIR, "project", True)
+        _add(CLOUD_MEMORY_INDEX_DELETED_DIR, "memory", True)
     return out
 
 
 def cmd_search(args):
-    files = _all_index_files()
+    files = _all_index_files(include_deleted=getattr(args, "deleted", False))
     if not files:
         print("no index — run: claudex index   (and optionally: claudex cloud-ingest)", file=sys.stderr)
         return 1
@@ -1001,10 +1293,10 @@ def cmd_search(args):
     if pat is None:
         return 1
     if args.source:
-        files = [(p, s) for (p, s) in files if s == args.source]
+        files = [(p, s, d) for (p, s, d) in files if s == args.source]
     since, until = getattr(args, "since", None), getattr(args, "until", None)
-    hits: list[tuple[str, Path, str, dict, list[str], list[tuple[int, str]]]] = []
-    for txt, source in files:
+    hits: list[tuple[str, Path, str, bool, dict, list[str], list[tuple[int, str]]]] = []
+    for txt, source, is_deleted in files:
         body_lines = txt.read_text(errors="replace").splitlines()
         meta = _meta_from_lines(body_lines)
         if not _in_date_range(meta, since, until):
@@ -1012,7 +1304,7 @@ def cmd_search(args):
         matched = [(i, line) for i, line in enumerate(body_lines) if pat.search(line)]
         if matched:
             end_ts = meta.get("end") or meta.get("start") or ""
-            hits.append((end_ts, txt, source, meta, body_lines, matched))
+            hits.append((end_ts, txt, source, is_deleted, meta, body_lines, matched))
     if not hits:
         print("no matches")
         return 0
@@ -1023,9 +1315,12 @@ def cmd_search(args):
         print(f"{total} match(es), showing {len(hits)} newest:\n")
     else:
         print(f"{total} match(es), newest first:\n")
-    for _end_ts, txt, source, meta, body_lines, matched in hits:
+    for _end_ts, txt, source, is_deleted, meta, body_lines, matched in hits:
         kind = meta.get("kind", "session")
-        tag = f"[{kind}]" if kind != "session" else ""
+        labels = [] if kind == "session" else [kind]
+        if is_deleted:
+            labels.append("deleted")
+        tag = f"[{' '.join(labels)}]" if labels else ""
         print(f"  {meta.get('session', txt.stem)} {tag}")
         topic = read_summary_topic(txt.stem, source=source)
         if topic:
@@ -1036,8 +1331,12 @@ def cmd_search(args):
             print(f"    parent: {meta['parent']}")
         if meta.get("cwd"):
             print(f"    cwd:    {meta['cwd']}")
-        print(f"    when:   {meta.get('start','')}  →  {meta.get('end','')}")
-        print(f"    turns:  {meta.get('turns','')}")
+        if meta.get("start") or meta.get("end"):
+            print(f"    when:   {meta.get('start','')}  →  {meta.get('end','')}")
+        if meta.get("docs"):
+            print(f"    docs:   {meta['docs']}")
+        if meta.get("turns"):
+            print(f"    turns:  {meta['turns']}")
         for i, line in matched[: args.max_per_file]:
             ctx_start = max(0, i - 1)
             ctx_end = min(len(body_lines), i + 2)
@@ -1053,15 +1352,19 @@ def resolve_sessions(prefix: str) -> list[dict]:
     index archive (survives Claude Code's transcript pruning), cloud raw
     JSON, and the cloud index.
 
-    Returns [{source, sid, live, index}] — live/index are Paths or None."""
+    Returns [{source, sid, live, index, deleted}] — live/index are Paths or None."""
     out: dict[tuple[str, str], dict] = {}
 
-    def add(source: str, sid: str, live: Path | None = None, index: Path | None = None):
-        e = out.setdefault((source, sid), {"source": source, "sid": sid, "live": None, "index": None})
+    def add(source: str, sid: str, live: Path | None = None, index: Path | None = None,
+            deleted: bool = False):
+        e = out.setdefault((source, sid), {"source": source, "sid": sid,
+                                           "live": None, "index": None, "deleted": False})
         if live:
             e["live"] = live
         if index:
             e["index"] = index
+        if deleted:
+            e["deleted"] = True
 
     for p in all_session_jsonls():
         if p.stem.startswith(prefix) or p.stem.startswith(f"agent-{prefix}"):
@@ -1076,6 +1379,21 @@ def resolve_sessions(prefix: str) -> list[dict]:
     if CLOUD_INDEX_DIR.exists():
         for p in CLOUD_INDEX_DIR.glob(f"{prefix}*.txt"):
             add("cloud", p.stem, index=p)
+    if CLOUD_PROJ_RAW_DIR.exists():
+        for p in CLOUD_PROJ_RAW_DIR.glob(f"{prefix}*.json"):
+            add("project", p.stem, live=p)
+    if CLOUD_PROJ_INDEX_DIR.exists():
+        for p in CLOUD_PROJ_INDEX_DIR.glob(f"{prefix}*.txt"):
+            add("project", p.stem, index=p)
+    # deleted tier: still resolvable on demand
+    if CLOUD_INDEX_DELETED_DIR.exists():
+        for p in CLOUD_INDEX_DELETED_DIR.glob(f"{prefix}*.txt"):
+            add("cloud", p.stem, index=p, deleted=True)
+    if CLOUD_PROJ_INDEX_DELETED_DIR.exists():
+        for p in CLOUD_PROJ_INDEX_DELETED_DIR.glob(f"{prefix}*.txt"):
+            if p.stem.endswith(".memory"):  # tombstones would shadow their project id
+                continue
+            add("project", p.stem, index=p, deleted=True)
     return sorted(out.values(), key=lambda e: (e["source"], e["sid"]))
 
 
@@ -1102,6 +1420,17 @@ def cmd_show(args):
     e = pick_session(args.session)
     if e is None:
         return 1
+    if e.get("deleted"):
+        print("(deleted upstream on claude.ai — retrieved from the deleted tier)", file=sys.stderr)
+    if e["source"] == "project":
+        # the project index IS the rendered form (docs + embedded memory)
+        if e["index"] and e["index"].exists():
+            sys.stdout.write(e["index"].read_text(errors="replace"))
+        else:
+            with e["live"].open() as f:
+                proj = json.load(f)
+            sys.stdout.write(render_project_index(proj, ""))
+        return 0
     if e["live"]:
         if e["source"] == "code":
             meta, turns = parse_session(e["live"])
@@ -1179,9 +1508,9 @@ def cmd_synthesize(args):
     if not shutil.which("claude"):
         print("`claude` CLI not on PATH — install Claude Code", file=sys.stderr)
         return 1
-    files = _all_index_files()
+    files = _all_index_files(include_deleted=getattr(args, "deleted", False))
     if args.source:
-        files = [(p, s) for (p, s) in files if s == args.source]
+        files = [(p, s, d) for (p, s, d) in files if s == args.source]
     if not files:
         print("no index — run: claudex index / cloud-ingest first", file=sys.stderr)
         return 1
@@ -1189,7 +1518,7 @@ def cmd_synthesize(args):
     if pat is None:
         return 1
     hits: list[tuple[str, str]] = []  # (session_id, source)
-    for txt, source in files:
+    for txt, source, _is_deleted in files:
         body = txt.read_text(errors="replace")
         if pat.search(body):
             hits.append((txt.stem, source))
@@ -1292,15 +1621,37 @@ def cmd_list(args):
                 sid, start, _end, cwd, _branch, turns = parts[:6]
                 label = cwd.replace(str(Path.home()), "~")
                 rows.append(("code", sid, start, label, turns))
-    if args.source in (None, "cloud") and CLOUD_MANIFEST.exists():
-        with CLOUD_MANIFEST.open() as f:
-            f.readline()
-            for line in f:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) < 5:
-                    continue
-                sid, start, _end, name, turns = parts[:5]
-                rows.append(("cloud", sid, start, name, turns))
+    include_deleted = getattr(args, "deleted", False)
+    cloud_manifests = [(CLOUD_MANIFEST, "")]
+    proj_manifests = [(CLOUD_PROJ_MANIFEST, "")]
+    if include_deleted:
+        cloud_manifests.append((CLOUD_MANIFEST_DELETED, " [deleted]"))
+        proj_manifests.append((CLOUD_PROJ_MANIFEST_DELETED, " [deleted]"))
+    if args.source in (None, "cloud"):
+        for manifest, mark in cloud_manifests:
+            if not manifest.exists():
+                continue
+            with manifest.open() as f:
+                f.readline()
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 5:
+                        continue
+                    sid, start, _end, name, turns = parts[:5]
+                    rows.append(("cloud", sid, start, name + mark, turns))
+    if args.source in (None, "project"):
+        for manifest, mark in proj_manifests:
+            if not manifest.exists():
+                continue
+            with manifest.open() as f:
+                f.readline()
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 6:
+                        continue
+                    pid, start, _end, name, docs, memory = parts[:6]
+                    extra = f"docs={docs}" + ("+mem" if memory == "yes" else "")
+                    rows.append(("proj", pid, start, name + mark, extra))
     if not rows:
         print("no manifest — run: claudex index   (and optionally: claudex cloud-ingest)", file=sys.stderr)
         return 1
@@ -1327,10 +1678,11 @@ def main():
     ps = sub.add_parser("search", help="search the index (regex, case-insensitive)")
     ps.add_argument("query")
     ps.add_argument("--max-per-file", type=int, default=3, help="max matches shown per session")
-    ps.add_argument("--source", choices=("code", "cloud"), default=None, help="restrict to one source")
+    ps.add_argument("--source", choices=("code", "cloud", "project", "memory"), default=None, help="restrict to one source")
     ps.add_argument("--limit", type=int, default=0, help="show only the N most recent matching sessions (0 = all)")
     ps.add_argument("--since", default=None, metavar="DATE", help="only sessions ending on/after ISO date, e.g. 2026-05 or 2026-05-01")
     ps.add_argument("--until", default=None, metavar="DATE", help="only sessions starting on/before ISO date")
+    ps.add_argument("--deleted", action="store_true", help="also search content deleted upstream on claude.ai")
     ps.set_defaults(fn=cmd_search)
 
     psh = sub.add_parser("show", help="prettify a session to stdout")
@@ -1340,8 +1692,9 @@ def main():
 
     pl = sub.add_parser("list", help="list indexed sessions, newest first")
     pl.add_argument("--limit", type=int, default=20)
-    pl.add_argument("--source", choices=("code", "cloud"), default=None)
+    pl.add_argument("--source", choices=("code", "cloud", "project"), default=None)
     pl.add_argument("--no-topic", action="store_true", help="hide topic lines from cached summaries")
+    pl.add_argument("--deleted", action="store_true", help="include content deleted upstream on claude.ai")
     pl.set_defaults(fn=cmd_list)
 
     psm = sub.add_parser("summarize", help="generate per-session summaries via Claude API (Haiku)")
@@ -1354,7 +1707,10 @@ def main():
     psy.add_argument("session", help="session id (prefix ok)")
     psy.set_defaults(fn=cmd_summary)
 
-    pci = sub.add_parser("cloud-ingest", help="ingest a claude.ai data export (conversations.json)")
+    pci = sub.add_parser("cloud-ingest", help="ingest a claude.ai data export (conversations, projects, memories)")
+    pci.add_argument("--full", action="store_true",
+                     help="export contains ALL conversations (not a ~30-day window) — "
+                          "enables deletion detection for conversations")
     pci.add_argument("--export", help="path to export dir (default: newest data-*-batch-0000 under ~/Downloads)")
     pci.add_argument("--force", action="store_true", help="rewrite even if cached")
     pci.set_defaults(fn=cmd_cloud_ingest)
@@ -1363,6 +1719,7 @@ def main():
     psyn.add_argument("query", help="regex (case-insensitive)")
     psyn.add_argument("--source", choices=("code", "cloud"), default=None)
     psyn.add_argument("--max", type=int, default=50, help="cap on matched sessions to include (default 50)")
+    psyn.add_argument("--deleted", action="store_true", help="also match content deleted upstream on claude.ai")
     psyn.set_defaults(fn=cmd_synthesize)
 
     pee = sub.add_parser("expecting-export", help="flag that you've requested a claude.ai data export — SessionStart hook will then check for arrival")

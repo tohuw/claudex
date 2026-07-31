@@ -35,6 +35,11 @@ class TmpDirsMixin(unittest.TestCase):
         "PROJECTS_DIR", "INDEX_DIR", "SUMMARIES_DIR", "MANIFEST",
         "CLOUD_RAW_DIR", "CLOUD_INDEX_DIR", "CLOUD_SUMMARIES_DIR",
         "CLOUD_MANIFEST", "SYNTHESES_DIR", "STATE_FILE",
+        "CLOUD_PROJ_RAW_DIR", "CLOUD_PROJ_INDEX_DIR", "CLOUD_PROJ_MANIFEST",
+        "CLOUD_PROJ_MEMORY_DIR", "CLOUD_MEMORY_RAW", "CLOUD_MEMORY_INDEX_DIR",
+        "CLOUD_INDEX_DELETED_DIR", "CLOUD_MANIFEST_DELETED",
+        "CLOUD_PROJ_INDEX_DELETED_DIR", "CLOUD_PROJ_MANIFEST_DELETED",
+        "CLOUD_MEMORY_INDEX_DELETED_DIR",
     )
 
     def setUp(self):
@@ -51,6 +56,17 @@ class TmpDirsMixin(unittest.TestCase):
         claudex.CLOUD_MANIFEST = self.root / "cloud" / "manifest.tsv"
         claudex.SYNTHESES_DIR = self.root / "syntheses"
         claudex.STATE_FILE = self.root / "state.json"
+        claudex.CLOUD_PROJ_RAW_DIR = self.root / "cloud" / "cproj" / "raw"
+        claudex.CLOUD_PROJ_MEMORY_DIR = self.root / "cloud" / "cproj" / "memory"
+        claudex.CLOUD_PROJ_INDEX_DIR = self.root / "cloud" / "cproj" / "index"
+        claudex.CLOUD_PROJ_MANIFEST = self.root / "cloud" / "cproj" / "manifest.tsv"
+        claudex.CLOUD_MEMORY_RAW = self.root / "cloud" / "memory" / "memories.json"
+        claudex.CLOUD_MEMORY_INDEX_DIR = self.root / "cloud" / "memory" / "index"
+        claudex.CLOUD_INDEX_DELETED_DIR = self.root / "cloud" / "index-deleted"
+        claudex.CLOUD_MANIFEST_DELETED = self.root / "cloud" / "manifest-deleted.tsv"
+        claudex.CLOUD_PROJ_INDEX_DELETED_DIR = self.root / "cloud" / "cproj" / "index-deleted"
+        claudex.CLOUD_PROJ_MANIFEST_DELETED = self.root / "cloud" / "cproj" / "manifest-deleted.tsv"
+        claudex.CLOUD_MEMORY_INDEX_DELETED_DIR = self.root / "cloud" / "memory" / "index-deleted"
 
     def tearDown(self):
         for a, v in self._saved.items():
@@ -261,6 +277,239 @@ class TestSearch(TmpDirsMixin):
             rc = claudex.cmd_search(self._args(query="oops("))
         self.assertEqual(rc, 1)
         self.assertIn("invalid regex", err.getvalue())
+
+
+PROJ_UUID = "0199aaaa-1111-2222-3333-444455556666"
+
+EXPORT_PROJECT = {
+    "uuid": PROJ_UUID,
+    "name": "Cyberwise",
+    "description": "Cyberpunk 2077 Assistant",
+    "prompt_template": "Reference Instructions.md for behavior.",
+    "created_at": "2025-09-19T01:35:39+00:00",
+    "updated_at": "2026-02-22T20:32:08+00:00",
+    "docs": [
+        {"uuid": "d1", "filename": "Remorse Settings.md",
+         "content": "How V feels about the flatline option."},
+    ],
+}
+
+EXPORT_MEMORIES = {
+    "account_uuid": "acct-1",
+    "conversations_memory": "Ron shoots a Nikon Z6 III.",
+    "project_memories": {PROJ_UUID: "User plays a nomad V with high remorse."},
+    "memory_files": [
+        {"path": "/areas/10tdb.md", "content": "Transmedia live music publication."},
+        {"path": "/topics/pets.md", "content": ""},  # empty → skipped
+    ],
+}
+
+
+def make_conv(uuid: str, text: str, updated: str) -> dict:
+    return {"uuid": uuid, "name": f"conv {uuid[:4]}", "created_at": updated,
+            "updated_at": updated,
+            "chat_messages": [{"sender": "human", "created_at": updated,
+                               "text": text, "content": [], "attachments": []}]}
+
+
+class ExportMixin(TmpDirsMixin):
+    def make_export(self, memories=EXPORT_MEMORIES, projects=(EXPORT_PROJECT,),
+                    convs=(), name="export") -> Path:
+        exp = self.root / name
+        (exp / "projects").mkdir(parents=True, exist_ok=True)
+        (exp / "conversations.json").write_text(json.dumps(list(convs)))
+        if memories is not None:
+            (exp / "memories.json").write_text(json.dumps([memories]))
+        for proj in projects:
+            (exp / "projects" / f"{proj['uuid']}.json").write_text(json.dumps(proj))
+        return exp
+
+    def ingest(self, exp: Path, force=False, full=False) -> str:
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            rc = claudex.cmd_cloud_ingest(Namespace(export=str(exp), force=force, full=full))
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    def search(self, query, **kw):
+        base = dict(query=query, source=None, max_per_file=3,
+                    limit=0, since=None, until=None, deleted=False)
+        base.update(kw)
+        with redirect_stdout(io.StringIO()) as out:
+            claudex.cmd_search(Namespace(**base))
+        return out.getvalue()
+
+
+class TestProjectMemoryIngest(ExportMixin):
+
+    def test_project_index_embeds_docs_and_memory(self):
+        out = self.ingest(self.make_export())
+        self.assertIn("projects indexed: 1 written", out)
+        self.assertIn("1 with project memory", out)
+        text = (claudex.CLOUD_PROJ_INDEX_DIR / f"{PROJ_UUID}.txt").read_text()
+        self.assertIn("# kind: project", text)
+        self.assertIn("# docs: 1", text)
+        self.assertIn("[PROMPT]\nReference Instructions.md", text)
+        self.assertIn("[MEMORY]\nUser plays a nomad V", text)
+        self.assertIn("[DOC Remorse Settings.md]\nHow V feels", text)
+        self.assertTrue((claudex.CLOUD_PROJ_RAW_DIR / f"{PROJ_UUID}.json").exists())
+        self.assertIn("Cyberwise", claudex.CLOUD_PROJ_MANIFEST.read_text())
+
+    def test_memory_index_written_and_empty_files_skipped(self):
+        self.ingest(self.make_export())
+        idx = claudex.CLOUD_MEMORY_INDEX_DIR
+        self.assertIn("Nikon Z6 III", (idx / "conversations-memory.txt").read_text())
+        self.assertIn("# name: /areas/10tdb.md", (idx / "areas-10tdb.md.txt").read_text())
+        self.assertFalse((idx / "topics-pets.md.txt").exists())
+        self.assertTrue(claudex.CLOUD_MEMORY_RAW.exists())
+
+    def test_reingest_cached_until_memory_changes(self):
+        exp = self.make_export()
+        self.ingest(exp)
+        self.assertIn("0 written, 1 cached", self.ingest(exp))
+        changed = dict(EXPORT_MEMORIES,
+                       project_memories={PROJ_UUID: "V went corpo after all."})
+        (exp / "memories.json").write_text(json.dumps([changed]))
+        self.assertIn("1 written, 0 cached", self.ingest(exp))
+        text = (claudex.CLOUD_PROJ_INDEX_DIR / f"{PROJ_UUID}.txt").read_text()
+        self.assertIn("V went corpo", text)
+        self.assertNotIn("nomad V", text)
+
+    def test_cleared_project_memory_moves_to_deleted_tier(self):
+        exp = self.make_export()
+        self.ingest(exp)
+        # newer export: memory cleared upstream, project since updated
+        cleared = dict(EXPORT_MEMORIES, project_memories={})
+        (exp / "memories.json").write_text(json.dumps([cleared]))
+        bumped = dict(EXPORT_PROJECT, updated_at="2026-03-01T00:00:00+00:00")
+        (exp / "projects" / f"{PROJ_UUID}.json").write_text(json.dumps(bumped))
+        self.ingest(exp)
+        text = (claudex.CLOUD_PROJ_INDEX_DIR / f"{PROJ_UUID}.txt").read_text()
+        self.assertIn("# end: 2026-03-01", text)
+        self.assertNotIn("[MEMORY]", text)  # no longer embedded in active index
+        tomb = claudex.CLOUD_PROJ_INDEX_DELETED_DIR / f"{PROJ_UUID}.memory.txt"
+        self.assertIn("User plays a nomad V", tomb.read_text())
+        self.assertNotIn("nomad V", self.search("nomad V"))
+        hit = self.search("nomad V", deleted=True)
+        self.assertIn("[project-memory deleted]", hit)
+        # memory restored upstream → tombstone goes away, embedding returns
+        (exp / "memories.json").write_text(json.dumps([EXPORT_MEMORIES]))
+        rebumped = dict(EXPORT_PROJECT, updated_at="2026-04-01T00:00:00+00:00")
+        (exp / "projects" / f"{PROJ_UUID}.json").write_text(json.dumps(rebumped))
+        self.ingest(exp)
+        self.assertFalse(tomb.exists())
+        self.assertIn("nomad V", self.search("nomad V"))
+
+    def test_search_finds_project_and_memory_with_source_filter(self):
+        self.ingest(self.make_export())
+        def search(**kw):
+            base = dict(query="x", source=None, max_per_file=3,
+                        limit=0, since=None, until=None)
+            base.update(kw)
+            with redirect_stdout(io.StringIO()) as out:
+                claudex.cmd_search(Namespace(**base))
+            return out.getvalue()
+        hit = search(query="flatline")
+        self.assertIn("[project]", hit)
+        self.assertIn(PROJ_UUID, hit)
+        hit = search(query="Nikon")
+        self.assertIn("[memory]", hit)
+        self.assertNotIn("Nikon", search(query="Nikon", source="project"))
+        self.assertNotIn("flatline", search(query="flatline", source="memory"))
+
+    def test_show_project_by_uuid_prefix(self):
+        self.ingest(self.make_export())
+        with redirect_stdout(io.StringIO()) as out:
+            rc = claudex.cmd_show(Namespace(session=PROJ_UUID[:8], no_tools=False))
+        self.assertEqual(rc, 0)
+        self.assertIn("[MEMORY]", out.getvalue())
+        self.assertIn("How V feels", out.getvalue())
+
+    def test_export_without_memories_or_projects_still_ingests(self):
+        exp = self.make_export(memories=None, projects=())
+        out = self.ingest(exp)
+        self.assertIn("cloud indexed: 0 written", out)
+        self.assertNotIn("projects indexed", out)
+
+
+class TestDeletedTier(ExportMixin):
+    P2 = dict(EXPORT_PROJECT, uuid="0199bbbb-1111-2222-3333-444455556666",
+              name="Ephemeral", description="short-lived project",
+              docs=[{"uuid": "d9", "filename": "notes.md", "content": "chrome flamingo"}])
+
+    def test_project_deleted_upstream_leaves_normal_search(self):
+        both = self.make_export(projects=(EXPORT_PROJECT, self.P2), name="e1")
+        self.ingest(both)
+        self.assertIn("chrome flamingo", self.search("chrome flamingo"))
+        # newer export (bumped updated_at) no longer contains P2
+        newer_proj = dict(EXPORT_PROJECT, updated_at="2026-05-01T00:00:00+00:00")
+        only_one = self.make_export(projects=(newer_proj,), name="e2")
+        out = self.ingest(only_one)
+        self.assertIn("moved out of normal search", out)
+        self.assertNotIn("chrome flamingo", self.search("chrome flamingo"))
+        hit = self.search("chrome flamingo", deleted=True)
+        self.assertIn("[project deleted]", hit)
+        self.assertIn(self.P2["uuid"], hit)
+        # show still resolves it on demand, with a stderr note
+        out_s, err_s = io.StringIO(), io.StringIO()
+        with redirect_stdout(out_s), redirect_stderr(err_s):
+            rc = claudex.cmd_show(Namespace(session=self.P2["uuid"][:8], no_tools=False))
+        self.assertEqual(rc, 0)
+        self.assertIn("chrome flamingo", out_s.getvalue())
+        self.assertIn("deleted upstream", err_s.getvalue())
+        # project comes back → restored to normal search
+        back = self.make_export(
+            projects=(newer_proj, dict(self.P2, updated_at="2026-06-01T00:00:00+00:00")),
+            name="e3")
+        out = self.ingest(back)
+        self.assertIn("restored", out)
+        self.assertIn("chrome flamingo", self.search("chrome flamingo"))
+
+    def test_conversation_deletion_needs_full_export(self):
+        c1 = make_conv("aaaa1111-0000-0000-0000-000000000001", "the samurai jacket", "2026-01-10T00:00:00+00:00")
+        c2 = make_conv("bbbb2222-0000-0000-0000-000000000002", "the arasaka tower", "2026-01-20T00:00:00+00:00")
+        full = self.make_export(convs=(c1, c2), name="e1")
+        out = self.ingest(full, full=True)
+        self.assertNotIn("deletion state unknown", out)
+        # windowed export without c1 must NOT mark it deleted — only add c3
+        c3 = make_conv("cccc3333-0000-0000-0000-000000000003", "the delamain cab", "2026-02-05T00:00:00+00:00")
+        window = self.make_export(convs=(c3,), name="e2")
+        self.ingest(window)
+        self.assertIn("samurai jacket", self.search("samurai jacket"))
+        self.assertIn("delamain cab", self.search("delamain cab"))
+        # newer FULL export without c1 → c1 moves to the deleted tier
+        full2 = self.make_export(
+            convs=(dict(c2, updated_at="2026-03-01T00:00:00+00:00"), c3), name="e3")
+        out = self.ingest(full2, full=True)
+        self.assertIn("moved out of normal search", out)
+        self.assertNotIn("samurai jacket", self.search("samurai jacket"))
+        self.assertIn("[cloud deleted]", self.search("samurai jacket", deleted=True))
+        self.assertIn("delamain cab", self.search("delamain cab"))
+
+    def test_old_export_cannot_resurrect_deleted_conversation(self):
+        c1 = make_conv("aaaa1111-0000-0000-0000-000000000001", "the samurai jacket", "2026-01-10T00:00:00+00:00")
+        e1 = self.make_export(convs=(c1,), name="e1")
+        self.ingest(e1, full=True)
+        c9 = make_conv("dddd9999-0000-0000-0000-000000000009", "the afterlife bar", "2026-05-01T00:00:00+00:00")
+        e2 = self.make_export(convs=(c9,), name="e2")
+        self.ingest(e2, full=True)
+        self.assertNotIn("samurai jacket", self.search("samurai jacket"))
+        # re-ingesting the old export merges content but keeps it in the deleted tier
+        self.ingest(e1)
+        self.assertNotIn("samurai jacket", self.search("samurai jacket"))
+        self.assertIn("samurai jacket", self.search("samurai jacket", deleted=True))
+
+    def test_list_deleted_flag(self):
+        c1 = make_conv("aaaa1111-0000-0000-0000-000000000001", "hello", "2026-01-10T00:00:00+00:00")
+        self.ingest(self.make_export(convs=(c1,), name="e1"), full=True)
+        c9 = make_conv("dddd9999-0000-0000-0000-000000000009", "later", "2026-05-01T00:00:00+00:00")
+        self.ingest(self.make_export(convs=(c9,), name="e2"), full=True)
+        def listing(deleted):
+            with redirect_stdout(io.StringIO()) as out:
+                claudex.cmd_list(Namespace(limit=0, source=None, no_topic=True, deleted=deleted))
+            return out.getvalue()
+        self.assertNotIn("aaaa1111", listing(False))
+        self.assertIn("[deleted]", listing(True))
+        self.assertIn("aaaa1111", listing(True))
 
 
 class TestPureHelpers(unittest.TestCase):

@@ -1,6 +1,6 @@
 ---
 name: claudex
-description: Search and retrieve prior Claude Code sessions and imported claude.ai conversations using the claudex archive. Use whenever the user refers to an earlier Claude conversation (for example, "we talked about X," "find the thread where," "what did we decide," or "continue that discussion"), asks to search/list/read/summarize Claude transcript history, or wants to ingest a claude.ai data export.
+description: Search and retrieve prior Claude Code sessions, imported claude.ai conversations, claude.ai projects (docs, prompts, project memory), and claude.ai memory using the claudex archive. Use whenever the user refers to an earlier Claude conversation (for example, "we talked about X," "find the thread where," "what did we decide," or "continue that discussion"), asks about a claude.ai project or what Claude's memory says, asks to search/list/read/summarize Claude transcript history, or wants to ingest a claude.ai data export.
 ---
 
 # Claudex
@@ -27,7 +27,7 @@ Resolve `<skill-dir>` to this skill directory. Do not crawl Claude transcript JS
    <skill-dir>/scripts/claudex search 'term|alternate term' --limit 5
    ```
 
-   Add `--source code` or `--source cloud`, plus `--since` or `--until`, when context supports narrowing.
+   Add `--source code|cloud|project|memory`, plus `--since` or `--until`, when context supports narrowing. `project` covers claude.ai project docs, prompt templates, and per-project memory; `memory` covers the global claude.ai memory and its memory-directory files. Content deleted upstream on claude.ai is excluded by default — add `--deleted` when the user asks about something that may have been deleted (hits are tagged `[... deleted]`).
 
 3. Use excerpts directly when sufficient. Distill results; never paste raw `claudex` output into the active conversation.
 
@@ -50,8 +50,11 @@ Resolve `<skill-dir>` to this skill directory. Do not crawl Claude transcript JS
 ## Other operations
 
 - List recent sessions: `list --limit 20`
+- List claude.ai projects: `list --source project`
+- Show a full claude.ai project (docs + memory): `show <project-uuid-prefix>`
 - Synthesize matching cached summaries: `synthesize '<regex>' --max 30`
-- Import the newest claude.ai export: `cloud-ingest`
+- Import the newest claude.ai export (conversations + projects + memories): `cloud-ingest`
+- Import an export known to contain ALL conversations (not a ~30-day window): `cloud-ingest --full` — this enables deletion detection for conversations; never pass `--full` unless the user confirms the export is complete
 - Import a specific export directory: `cloud-ingest --export <path>`
 - Track export arrival: run `expecting-export`, then use `auto-detect`
 - Suppress an unwanted export notice: `dismiss <export-folder>`
